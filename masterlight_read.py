@@ -6,6 +6,8 @@ from numba import njit
 from skimage.restoration import estimate_sigma
 from skimage.metrics import structural_similarity as ssim
 from skimage.metrics import peak_signal_noise_ratio as psnr
+import astropy as ap
+
 
 
 #dorzucam njita do adaptywnego tresholdingu
@@ -35,25 +37,42 @@ def f_adaptive_tresholding(subband, lambda_b, mask):
 class PixInsightMasterDenoisingPipeline:
     def __init__(self, master_light_path):
         """
-        Etap I: Inicjalizacja potoku.
-        Wczytanie 32-bitowego liniowego pliku Master Light i normalizacja macierzy.
+        Etap I: Inicjalizacja potoku
+        Automatyczne rozpoznawanie formatu (TIFF / FITS) 
+        i wczytanie 32-bitowego liniowego pliku Master Light.
         """
-        
         self.master_light_path = master_light_path
-       
-        with Image.open(master_light_path) as img:
-            
-            self.master_light = np.array(img.convert('F'), dtype=np.float32)
-            
         
+   
+        _, ext = os.path.splitext(master_light_path)
+        ext = ext.lower()
+        
+        if ext in ['.fit', '.fits']:
+            print(f"[Inicjalizacja] Wykryto plik naukowy FITS: {master_light_path}")
+            # Astropy otwiera plik jako listę bloków danych (HDU)
+            with fits.open(master_light_path) as hdul:
+                # Zazwyczaj dane obrazu znajdują się w głównym bloku (index 0)
+                data = hdul[0].data
+                if data is None:
+                    data = hdul[1].data # Zabezpieczenie na wypadek innej struktury FITS
+                
+                self.master_light = np.array(data, dtype=np.float32)
+                
+        elif ext in ['.tif', '.tiff']:
+            print(f"[Inicjalizacja] Wykryto plik TIFF: {master_light_path}")
+            with Image.open(master_light_path) as img:
+                self.master_light = np.array(img.convert('F'), dtype=np.float32)
+                
+        else:
+            raise ValueError(f"Nieobsługiwany format pliku: {ext}. Użyj .tif lub .fit")
+            
         self.min_val = np.min(self.master_light)
         self.max_val = np.max(self.master_light)
         
-        
-        print(f"ADU: {self.min_val:.5f} to {self.max_val:.5f}")
+        print(f"Zakres sygnału (Min/Max): {self.min_val:.5f} do {self.max_val:.5f}")
     
+        # Normalizacja statystyczna
         self.normalized_image = (self.master_light - self.min_val) / (self.max_val - self.min_val)
-        
         
         self.sigma_noise = None
         self.luminance_mask = None
