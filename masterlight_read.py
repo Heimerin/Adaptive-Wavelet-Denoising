@@ -5,6 +5,7 @@ from PIL import Image
 from numba import njit
 from skimage.restoration import estimate_sigma
 from skimage.metrics import structural_similarity as ssim
+from skimage.metrics import peak_signal_noise_ratio as psnr
 
 
 #dorzucam njita do adaptywnego tresholdingu
@@ -38,6 +39,7 @@ class PixInsightMasterDenoisingPipeline:
         Wczytanie 32-bitowego liniowego pliku Master Light i normalizacja macierzy.
         """
         
+        self.master_light_path = master_light_path
        
         with Image.open(master_light_path) as img:
             
@@ -58,6 +60,8 @@ class PixInsightMasterDenoisingPipeline:
         self.denoised_output = None
         self.best_wavelet = 'db4'
         self.best_level = 3
+        self.best_threshold_scale = 1.0
+        self.metrics = {}
 
     def estimate_residual_noise(self):
         """
@@ -106,7 +110,7 @@ class PixInsightMasterDenoisingPipeline:
 
         return self.luminance_mask
     
-    def wavelet_denoising(self):
+    def wavelet_denoising(self, wavelet=None, level=None, threshold_scale=1.0, store_result=True):
         """
         Bayes Shrink
         """
@@ -114,8 +118,13 @@ class PixInsightMasterDenoisingPipeline:
         if self.sigma_noise is None or self.luminance_mask is None:
             raise ValueError("Brak estymacji szumu i maski!")
 
+        if wavelet is None:
+            wavelet = self.best_wavelet
+        if level is None:
+            level = self.best_level
+
         #1 el rekompozycja obrazu 
-        coeffs = pywt.wavedec2(self.normalized_image, self.best_wavelet, level=self.best_level)
+        coeffs = pywt.wavedec2(self.normalized_image, wavelet, level=level)
 
         new_coeffs = [coeffs[0]]
 
@@ -132,6 +141,7 @@ class PixInsightMasterDenoisingPipeline:
                     lambda_b = 1000.0 #duzy prog, ale celowo, zeby nie bylo dzielenia przez zero
                 else:
                     lambda_b = (self.sigma_noise**2)/sigma_x
+                lambda_b = lambda_b * threshold_scale
                 h_sub, w_sub= subband.shape
                 resized_mask = cv2.resize(self.luminance_mask, (w_sub, h_sub), interpolation=cv2.INTER_AREA) #dodalem interpolacje, tutaj przy schodzeniu falkowym, zamiast probkowac punktowo, usredniamy ze zmniejszenego obszaru
                 subband_filtered=f_adaptive_tresholding(subband, lambda_b, resized_mask)
@@ -139,37 +149,234 @@ class PixInsightMasterDenoisingPipeline:
 
             new_coeffs.append(tuple(filtered_level))
 
-        self.denoised_output = pywt.waverec2(new_coeffs, self.best_wavelet)
-        return self.denoised_output
+        denoised_output = pywt.waverec2(new_coeffs, wavelet)
+        h, w = self.normalized_image.shape
+        denoised_output = denoised_output[:h, :w]
+        denoised_output = np.clip(denoised_output, 0.0, 1.0)
+
+        if store_result:
+            self.denoised_output = denoised_output
+            self.best_wavelet = wavelet
+            self.best_level = level
+            self.best_threshold_scale = threshold_scale
+
+        return denoised_output
+    
+    # 5. GRID SEARCH 
+    # -------------------------------------------------------------------------
+
+    def optimize_hyperparameters(
+        self,
+        wavelets=("db2", "db4", "sym4", "coif2"),
+        levels=(1, 2, 3),
+        threshold_scales=(0.8, 1.0, 1.2),
+    ):
+        """
+        Uwaga metodologiczna:
+        ---------------------
+        W prawdziwych danych astrofoto zwykle nie mamy obrazu idealnie czystego,
+        więc nie da się policzyć klasycznego SSIM względem ground truth. Dlatego
+        stosujemy kompromis:
+        - SSIM(original, denoised) pilnuje, żeby nie niszczyć struktury obrazu;
+        - std(residuals) premiuje usunięcie części szumu;
+        - kara za średnią rezyduów ogranicza przesuwanie jasności tła.
+
+        Wynik score nie jest absolutną miarą jakości, ale pomaga automatycznie
+        wybrać rozsądne parametry startowe do prezentacji i testów.
+        """
+        if self.sigma_noise is None:
+            self.estimate_residual_noise()
+        if self.luminance_mask is None:
+            self.create_luminance_mask()
+
+        best_score = -np.inf
+        best_result = None
+        best_params = {}
+
+        for wavelet in wavelets:
+            for level in levels:
+                for threshold_scale in threshold_scales:
+                    try:
+                        candidate = self.wavelet_denoising(
+                            wavelet=wavelet,
+                            level=level,
+                            threshold_scale=threshold_scale,
+                            store_result=False,
+                        )
+
+                        residuals = self.normalized_image - candidate
+
+                        # SSIM bliski 1 oznacza, że struktura obrazu została zachowana.
+                        structural_score = float(
+                            ssim(
+                                self.normalized_image,
+                                candidate,
+                                data_range=1.0,
+                            )
+                        )
+
+                        # Im większe std rezyduów, tym więcej usunięto drobnej składowej.
+                        # Nie chcemy jednak usuwać struktury, dlatego SSIM jest najważniejszy.
+                        residual_std = float(np.std(residuals))
+                        residual_mean_abs = float(abs(np.mean(residuals)))
+
+                        # Heurystyczny score: zachowaj strukturę, usuń trochę szumu,
+                        # nie przesuwaj globalnie jasności.
+                        score = structural_score + 0.15 * residual_std - 0.50 * residual_mean_abs
+
+                        print(
+                            "Grid search:",
+                            f"wavelet={wavelet}",
+                            f"level={level}",
+                            f"scale={threshold_scale}",
+                            f"SSIM={structural_score:.5f}",
+                            f"res_std={residual_std:.6f}",
+                            f"score={score:.5f}",
+                        )
+
+                        if score > best_score:
+                            best_score = score
+                            best_result = candidate
+                            best_params = {
+                                "wavelet": wavelet,
+                                "level": int(level),
+                                "threshold_scale": float(threshold_scale),
+                                "score": float(score),
+                                "ssim_original_vs_denoised": structural_score,
+                                "residual_std": residual_std,
+                                "residual_mean_abs": residual_mean_abs,
+                            }
+                    except Exception as exc:
+                        # Nie każda falka i poziom pasują do każdego rozmiaru obrazu.
+                        print(f"[Grid search] Pominięto {wavelet}, level={level}, scale={threshold_scale}: {exc}")
+
+        if best_result is None:
+            raise RuntimeError("Grid search nie znalazł żadnej poprawnej konfiguracji.")
+
+        self.best_wavelet = best_params["wavelet"]
+        self.best_level = best_params["level"]
+        self.best_threshold_scale = best_params["threshold_scale"]
+        self.denoised_output = best_result
+        self.metrics.update(best_params)
+
+        print(
+            f"[Grid search] Najlepsze parametry: wavelet={self.best_wavelet}, "
+            f"level={self.best_level}, scale={self.best_threshold_scale}, "
+            f"score={best_params['score']:.5f}"
+        )
+        return best_params
     
     #residual map Residual = original - denoised
-    def export(self, output_path = "master_light_denoised.tiff")
+    def export(self, output_path="master_light_denoised.tiff"):
         """
-        denormalizacja i zapis do 32 bit TIFF
-        WAZNE: WRACAMY DO MORYGINALNEJ ROZPIETOSCI adu  Z MATRYCY KAMERy
+        Eksport do 32-bitowego pliku TIFF.
+        Zapisujemy w znormalizowanym przedziale [0.0, 1.0], 
+        aby zapewnić kompatybilność z programami takimi jak Darktable czy Siril.
         """
-
         if self.denoised_output is None:
             raise ValueError("Brak odszumionego obrazu!")
         
-        #Na to zwrocic uwage:
-        print(f"Przywracanie skali ADU ({self.min_val:.5f} do {self.max_val:.5f})...")
-        final_array = self.denoised_output * (self.max_val - self.min_val) + self.min_val
-        final_array = np.clip(final_array, self.min_val, self.max_val)
+        print("[Eksport] Przygotowywanie 32-bitowego pliku TIFF (skala 0.0 - 1.0)...")
+        
+        # Bezpieczne skopiowanie znormalizowanego obrazu
+        final_array = np.clip(self.denoised_output, 0.0, 1.0)
 
-        #zapis oprzez pillow, musi byc bez kompresji do pozniejszej analizyw  astro soft
-        final_image = Image.fromarray(final_array.astype(np.float32))
+        # Zapis przez Pillow w formacie 32-bit float ('F')
+        final_image = Image.fromarray(final_array.astype(np.float32), mode='F')
         final_image.save(output_path)
+        print(f"[Sukces] Zapisano plik: {output_path}")
+
+    def export_to_pixinsight(self, output_path="master_light_denoised.tiff"):
+        self.export(output_path)
 
 
     def calculate_residuals(self, residual_path="master_light_residuals.tiff"):
+        """
+        Generowanie i zapis mapy usuniętego szumu w skali kompatybilnej.
+        """
+        if self.denoised_output is None:
+            raise ValueError("Brak odszumionego obrazu!")
+            
+        # Obliczenie różnicy i przesunięcie szumu do średniej szarości (0.5)
         residuals = self.normalized_image - self.denoised_output
-        residuals_shifted = residuals + 0.5
-        residuals_shifted = np.clip(residuals_shifted, 0.0, 1.0)
+        residuals_shifted = np.clip(residuals + 0.5, 0.0, 1.0)
         
-        # Denormalizacja do ADU, aby plik był kompatybilny z naszym środowiskiem
-        residuals_adu = residuals_shifted * (self.max_val - self.min_val) + self.min_val
-        
-        res_img = Image.fromarray(residuals_adu.astype(np.float32))
+        # Zapis bezpośrednio w skali 0.0 - 1.0 z wymuszeniem trybu 'F'
+        res_img = Image.fromarray(residuals_shifted.astype(np.float32), mode='F')
         res_img.save(residual_path)
-        print(f"[Analityka] Mapa usuniętego szumu zapisana jako: {residual_path}")
+        print(f"Mapa usuniętego szumu zapisana jako: {residual_path}")
+
+    #======= Metryki
+    def calculate_quality_metrics(self):
+        """
+        Obliczenie metryk jakości po odszumianiu.
+
+        Metryki:
+        --------
+        MSE:
+            Średni błąd kwadratowy między obrazem wejściowym i odszumionym.
+
+        PSNR:
+            Peak Signal-to-Noise Ratio liczony względem oryginału. Przy braku
+            ground truth traktujemy go jako informację, jak mocno zmienił się obraz.
+
+        SSIM:
+            Strukturalne podobieństwo oryginału i wyniku. Blisko 1 oznacza, że
+            geometria i struktura obrazu są dobrze zachowane.
+
+        residual_*:
+            Statystyki mapy różnicowej. Przydatne do omówienia w prezentacji.
+        """
+        residuals = self.normalized_image - self.denoised_output
+        mse_value = float(np.mean((self.normalized_image - self.denoised_output) ** 2))
+
+        metrics = {
+            "best_wavelet": self.best_wavelet,
+            "best_level": float(self.best_level),
+            "threshold_scale": float(self.best_threshold_scale),
+            "mse_original_vs_denoised": mse_value,
+            "psnr_original_vs_denoised": float(psnr(self.normalized_image, self.denoised_output, data_range=1.0)),
+            "ssim_original_vs_denoised": float(ssim(self.normalized_image, self.denoised_output, data_range=1.0)),
+            "residual_mean": float(np.mean(residuals)),
+            "residual_std": float(np.std(residuals)),
+            "residual_min": float(np.min(residuals)),
+            "residual_max": float(np.max(residuals)),
+        }
+
+        self.metrics.update(metrics)
+
+        print("[Metryki] Wyniki jakości:")
+        for key, value in metrics.items():
+            if isinstance(value, float):
+                print(f"  {key}: {value:.8f}")
+            else:
+                print(f"  {key}: {value}")
+
+        return self.metrics
+    
+
+    #============ Raport
+    def save_report(self, report_path="master_light_report.txt"):
+        if not self.metrics:
+            print("[Raport] Brak metryk, liczę calculate_quality_metrics()...")
+            self.calculate_quality_metrics()
+
+        lines = [
+            "Raport Adaptive Wavelet Denoising",
+            "=================================",
+            f"Plik wejściowy: {self.master_light_path}",
+            f"Zakres ADU: {self.min_val:.8f} - {self.max_val:.8f}",
+            f"Najlepsza falka: {self.best_wavelet}",
+            f"Najlepszy poziom DWT: {self.best_level}",
+            f"Skala progu: {self.best_threshold_scale}",
+            "",
+            "Metryki:",
+        ]
+
+        for key, value in sorted(self.metrics.items()):
+            lines.append(f"- {key}: {value}")
+
+        with open(report_path, "w", encoding="utf-8") as report_file:
+            report_file.write("\n".join(lines))
+
+        print(f"[Raport] Zapisano raport jako: {report_path}")
